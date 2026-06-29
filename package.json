@@ -1,0 +1,23 @@
+{
+  "name": "aranna-web",
+  "version": "0.1.0",
+  "description": "ARPG web 3D inspirado em Dungeon Siege: Legends of Aranna (esqueleto base)",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "optimize:assets": "node scripts/optimize-assets.mjs",
+    "optimize:models": "node scripts/optimize-models.mjs",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "three": "^0.165.0"
+  },
+  "devDependencies": {
+    "@types/three": "^0.165.0",
+    "sharp": "^0.35.2",
+    "typescript": "^5.4.5",
+    "vite": "^5.2.0"
+  }
+}
