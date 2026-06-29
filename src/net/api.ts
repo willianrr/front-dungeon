@@ -1,7 +1,7 @@
 // Cliente REST do backend (accounts/characters).
-// Le a URL de import.meta.env.VITE_API_URL.
+// Le a URL de ./runtimeConfig (runtime > import.meta.env > localhost).
 
-const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8080/api/v1';
+import { API_URL } from './runtimeConfig';
 
 interface Envelope<T> {
   data?: T;

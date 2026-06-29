@@ -1,12 +1,13 @@
 import type { NetworkClient } from './NetworkClient';
 import type { Command, WorldSnapshot } from '../shared/types';
 import { generateWorld, type WorldData } from '../shared/worldgen';
+import { WS_URL } from './runtimeConfig';
 
 // Cliente ONLINE: fala WebSocket com o servidor Go autoritativo. O servidor
 // manda a seed (regeneramos o mundo identico) e o WorldSnapshot a cada tick.
 // O resto do jogo (render/input) fica isolado atras da interface NetworkClient.
 
-const WS_URL = import.meta.env.VITE_WS_URL ?? 'ws://localhost:8080/ws/game';
+// WS_URL vem de ./runtimeConfig (runtime > import.meta.env > localhost).
 const SNAPSHOT_PARSE_WARN_MS = 8;
 const SNAPSHOT_STATS_INTERVAL_MS = 3000;
 const SNAPSHOT_DROP_LOG_THRESHOLD = 20;
