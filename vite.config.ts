@@ -4,10 +4,10 @@ export default defineConfig({
   server: {
     port: 5173,
     open: true,
-    allowedHosts: ['.loca.lt', '.trycloudflare.com'],
+    allowedHosts: ['.loca.lt', '.trycloudflare.com', 'front-dungeon-764196a4.mithrill.com.br'],
   },
   preview: {
-    allowedHosts: ['.loca.lt', '.trycloudflare.com'],
+    allowedHosts: ['.loca.lt', '.trycloudflare.com', 'front-dungeon-764196a4.mithrill.com.br'],
   },
   build: {
     target: 'es2022',
