@@ -42,7 +42,7 @@ export class World {
   private shadowMapSize = 2048;
 
   constructor(canvas: HTMLCanvasElement, world: WorldData, registry?: ModelRegistry) {
-    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance' });
     this.renderer.setPixelRatio(this.currentPixelRatio());
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;

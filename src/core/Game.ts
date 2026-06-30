@@ -107,11 +107,14 @@ const GAMEPLAY_ASSET_PRELOAD_TIMEOUT = 7000;
 // congelamento); golpes/efeitos podem se sobrepor, entao aquecemos uma faixa.
 const WARMUP_MAX_EFFECT_LIGHTS = 4;
 const RENDER_QUALITY_STORAGE_KEY = 'aranna:render-quality:v1';
+const RENDER_CLIENT_PRESENCE_KEY_PREFIX = 'aranna:render-client:v1:';
 const RENDER_QUALITY_MODES: readonly RenderQualityMode[] = ['auto', 'high', 'medium', 'low'];
-const AUTO_QUALITY_SAMPLE_SECONDS = 4;
-const AUTO_QUALITY_COOLDOWN_SECONDS = 8;
-const AUTO_QUALITY_DOWNGRADE_FPS = 44;
-const AUTO_QUALITY_UPGRADE_FPS = 58;
+const RENDER_CLIENT_PRESENCE_TTL_MS = 3000;
+const RENDER_CLIENT_PRESENCE_INTERVAL_SECONDS = 1;
+const AUTO_QUALITY_SAMPLE_SECONDS = 2;
+const AUTO_QUALITY_COOLDOWN_SECONDS = 4;
+const AUTO_QUALITY_DOWNGRADE_FPS = 52;
+const AUTO_QUALITY_UPGRADE_FPS = 59;
 const FRAME_STALL_WARN_MS = 120;
 const FRAME_STALL_LOG_COOLDOWN_MS = 1500;
 const FRAME_STALL_SEVERE_MS = 500;
@@ -131,21 +134,21 @@ const RENDER_QUALITY_PRESETS: Record<RenderQualityLevel, RenderQualityPreset> = 
   high: {
     bloom: true,
     bloomStrength: 1.08,
-    pixelRatioCap: 1.5,
+    pixelRatioCap: 1,
     shadows: true,
-    shadowMapSize: 2048,
+    shadowMapSize: 1024,
   },
   medium: {
     bloom: false,
     bloomStrength: 0,
-    pixelRatioCap: 1,
+    pixelRatioCap: 0.85,
     shadows: false,
     shadowMapSize: 1536,
   },
   low: {
     bloom: false,
     bloomStrength: 0,
-    pixelRatioCap: 0.75,
+    pixelRatioCap: 0.65,
     shadows: false,
     shadowMapSize: 512,
   },
@@ -207,6 +210,9 @@ export class Game {
   private lastSnapshotTick = -1;
   private localPlayerMoving = false;
   private localPlayerRunning = false;
+  private readonly clientPresenceId = this.createClientPresenceId();
+  private clientPresenceTimer = 0;
+  private localVisibleClients = 1;
   private renderQualityMode: RenderQualityMode = this.readRenderQualityMode();
   private autoQualityLevel: RenderQualityLevel = this.initialAutoQualityLevel();
   private qualitySampleSeconds = 0;
@@ -240,6 +246,8 @@ export class Game {
 
     this.resize();
     window.addEventListener('resize', () => this.resize());
+    window.addEventListener('pagehide', () => this.clearClientPresence());
+    window.addEventListener('beforeunload', () => this.clearClientPresence());
   }
 
   /** Carrega o heroi, mostra a tela de loading e so entao inicia o loop. */
@@ -531,6 +539,7 @@ export class Game {
     this.elapsed += dt;
 
     this.processInput(dt);
+    this.updateClientPresence(qualityDt);
     this.updateAutoQuality(qualityDt);
     this.net.update(dt);
     const snapshot = this.net.getSnapshot();
@@ -613,9 +622,7 @@ export class Game {
   }
 
   private initialAutoQualityLevel(): RenderQualityLevel {
-    const cores = navigator.hardwareConcurrency ?? 8;
-    if (window.devicePixelRatio >= 2 || cores <= 4) return 'low';
-    return 'medium';
+    return 'low';
   }
 
   private cycleRenderQualityMode(): void {
@@ -636,8 +643,69 @@ export class Game {
     }
   }
 
+  private createClientPresenceId(): string {
+    try {
+      return crypto.randomUUID();
+    } catch {
+      return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+    }
+  }
+
+  private updateClientPresence(dt: number): void {
+    this.clientPresenceTimer -= dt;
+    if (this.clientPresenceTimer > 0) return;
+    this.clientPresenceTimer = RENDER_CLIENT_PRESENCE_INTERVAL_SECONDS;
+
+    try {
+      const now = Date.now();
+      const ownKey = RENDER_CLIENT_PRESENCE_KEY_PREFIX + this.clientPresenceId;
+      window.localStorage.setItem(ownKey, String(now));
+      let active = 0;
+
+      for (let index = window.localStorage.length - 1; index >= 0; index--) {
+        const key = window.localStorage.key(index);
+        if (!key?.startsWith(RENDER_CLIENT_PRESENCE_KEY_PREFIX)) continue;
+        const timestamp = Number(window.localStorage.getItem(key));
+        if (!Number.isFinite(timestamp) || now - timestamp > RENDER_CLIENT_PRESENCE_TTL_MS) {
+          window.localStorage.removeItem(key);
+          continue;
+        }
+        active++;
+      }
+
+      if (active !== this.localVisibleClients) {
+        this.localVisibleClients = Math.max(1, active);
+        if (this.renderQualityMode === 'auto') {
+          const previous = this.autoQualityLevel;
+          this.autoQualityLevel = this.clampQualityLevel(this.autoQualityLevel, this.maxAutoQualityLevel());
+          if (previous !== this.autoQualityLevel) this.applyRenderQuality();
+        }
+      }
+    } catch {
+      this.localVisibleClients = 1;
+    }
+  }
+
+  private clearClientPresence(): void {
+    try {
+      window.localStorage.removeItem(RENDER_CLIENT_PRESENCE_KEY_PREFIX + this.clientPresenceId);
+    } catch {
+      // Storage opcional.
+    }
+  }
+
   private updateAutoQuality(dt: number): void {
     if (this.renderQualityMode !== 'auto' || dt <= 0) return;
+    const cap = this.maxAutoQualityLevel();
+    if (this.qualityRank(this.autoQualityLevel) > this.qualityRank(cap)) {
+      this.autoQualityLevel = cap;
+      this.qualitySampleSeconds = 0;
+      this.qualitySampleFrames = 0;
+      this.qualityCooldown = AUTO_QUALITY_COOLDOWN_SECONDS;
+      this.applyRenderQuality();
+      return;
+    }
+
     this.qualityCooldown = Math.max(0, this.qualityCooldown - dt);
     this.qualitySampleSeconds += dt;
     this.qualitySampleFrames++;
@@ -652,7 +720,7 @@ export class Game {
     if (fps < AUTO_QUALITY_DOWNGRADE_FPS) {
       this.autoQualityLevel = this.lowerQualityLevel(this.autoQualityLevel);
     } else if (fps > AUTO_QUALITY_UPGRADE_FPS) {
-      this.autoQualityLevel = this.raiseQualityLevel(this.autoQualityLevel);
+      this.autoQualityLevel = this.clampQualityLevel(this.raiseQualityLevel(this.autoQualityLevel), cap);
     }
     if (previous === this.autoQualityLevel) return;
 
@@ -683,8 +751,21 @@ export class Game {
 
   private raiseQualityLevel(level: RenderQualityLevel): RenderQualityLevel {
     if (level === 'low') return 'medium';
-    if (level === 'medium') return 'high';
-    return 'high';
+    return 'medium';
+  }
+
+  private maxAutoQualityLevel(): RenderQualityLevel {
+    return this.localVisibleClients > 1 ? 'low' : 'medium';
+  }
+
+  private clampQualityLevel(level: RenderQualityLevel, max: RenderQualityLevel): RenderQualityLevel {
+    return this.qualityRank(level) > this.qualityRank(max) ? max : level;
+  }
+
+  private qualityRank(level: RenderQualityLevel): number {
+    if (level === 'low') return 0;
+    if (level === 'medium') return 1;
+    return 2;
   }
 
   private effectiveRenderQualityLevel(): RenderQualityLevel {
