@@ -225,6 +225,7 @@ export class HUD {
   private hotbarRenderKey = '';
   private inventoryRenderKey = '__initial_inventory__';
   private characterRenderKey = '';
+  private minimapRenderKey = '';
 
   constructor(layer: HTMLElement, profile: PlayerProfile, private readonly world: WorldData) {
     layer.innerHTML = TEMPLATE;
@@ -326,7 +327,16 @@ export class HUD {
     this.questTitle.textContent = snapshot.quest.title;
     this.questObjective.textContent = snapshot.quest.objective;
     this.questProgress.style.width = `${Math.min(100, (snapshot.quest.progress / snapshot.quest.goal) * 100)}%`;
-    this.renderMinimap(snapshot, player);
+    const minimapKey = [
+      snapshot.zone,
+      snapshot.tick,
+      this.minimapCanvas.clientWidth,
+      this.minimapCanvas.clientHeight,
+    ].join(':');
+    if (minimapKey !== this.minimapRenderKey) {
+      this.minimapRenderKey = minimapKey;
+      this.renderMinimap(snapshot, player);
+    }
 
     const inventoryKey = snapshot.inventory
       .map((item) => [
@@ -782,6 +792,7 @@ export class HUD {
       : null;
     slotEl.onkeydown = item
       ? (event) => {
+        if (event.repeat) return;
         if (event.key !== 'Enter' && event.key !== ' ') return;
         event.preventDefault();
         this.onUnequipSlot(slot);

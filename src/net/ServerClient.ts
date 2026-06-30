@@ -11,6 +11,7 @@ import { WS_URL } from './runtimeConfig';
 const SNAPSHOT_PARSE_WARN_MS = 8;
 const SNAPSHOT_STATS_INTERVAL_MS = 3000;
 const SNAPSHOT_DROP_LOG_THRESHOLD = 20;
+const COMMAND_STATS_INTERVAL_MS = 3000;
 
 function emptySnapshot(): WorldSnapshot {
   return {
@@ -39,6 +40,9 @@ export class ServerClient implements NetworkClient {
   private parsedSnapshots = 0;
   private parseTimeMs = 0;
   private lastStatsAt = 0;
+  private sentCommandCounts = new Map<string, number>();
+  private sentCommandBytes = 0;
+  private lastCommandStatsAt = 0;
 
   constructor(private readonly token: string, private readonly characterId: number) {}
 
@@ -105,7 +109,9 @@ export class ServerClient implements NetworkClient {
 
   send(cmd: Command): void {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(cmd));
+      const payload = JSON.stringify(cmd);
+      this.ws.send(payload);
+      this.recordSentCommand(cmd.type, payload.length);
     }
   }
 
@@ -145,6 +151,28 @@ export class ServerClient implements NetworkClient {
     this.parseTimeMs = 0;
     this.droppedPendingSnapshots = 0;
     this.lastStatsAt = now;
+  }
+
+  private recordSentCommand(type: string, bytes: number): void {
+    this.sentCommandCounts.set(type, (this.sentCommandCounts.get(type) ?? 0) + 1);
+    this.sentCommandBytes += bytes;
+    const now = performance.now();
+    if (this.lastCommandStatsAt === 0) this.lastCommandStatsAt = now;
+    if (now - this.lastCommandStatsAt < COMMAND_STATS_INTERVAL_MS) return;
+
+    let total = 0;
+    const byType = [...this.sentCommandCounts.entries()]
+      .map(([commandType, count]) => {
+        total += count;
+        return `${commandType}:${count}`;
+      })
+      .join(' ');
+    if (total > 0) {
+      console.info(`[ServerClient] comandos_enviados=${total} bytes=${this.sentCommandBytes} ${byType}`);
+    }
+    this.sentCommandCounts.clear();
+    this.sentCommandBytes = 0;
+    this.lastCommandStatsAt = now;
   }
 
   getSnapshot(): WorldSnapshot {

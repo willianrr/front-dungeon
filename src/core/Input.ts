@@ -22,6 +22,7 @@ export class Input {
   private characterToggleQueued = false;
   private sfxMuteToggleQueued = false;
   private qualityToggleQueued = false;
+  private movementChangedQueued = false;
   private readonly movementKeys = new Set<string>();
 
   constructor(canvas: HTMLCanvasElement) {
@@ -46,8 +47,15 @@ export class Input {
     window.addEventListener('keydown', (e) => {
       if (e.key === 'q' || e.key === 'Q') this.rotateDir = -1;
       if (e.key === 'e' || e.key === 'E') this.rotateDir = 1;
-      if (e.key === 'Shift') this.running = true;
-      if (['KeyW', 'KeyA', 'KeyS', 'KeyD'].includes(e.code)) this.movementKeys.add(e.code);
+      if (e.key === 'Shift' && !this.running) {
+        this.running = true;
+        this.movementChangedQueued = true;
+      }
+      if (['KeyW', 'KeyA', 'KeyS', 'KeyD'].includes(e.code) && !this.movementKeys.has(e.code)) {
+        this.movementKeys.add(e.code);
+        this.movementChangedQueued = true;
+      }
+      if (e.repeat) return;
       if (e.code === 'Space') {
         this.jumpQueued = true;
         e.preventDefault();
@@ -65,8 +73,18 @@ export class Input {
     });
     window.addEventListener('keyup', (e) => {
       if (['q', 'Q', 'e', 'E'].includes(e.key)) this.rotateDir = 0;
-      if (e.key === 'Shift') this.running = false;
-      this.movementKeys.delete(e.code);
+      if (e.key === 'Shift' && this.running) {
+        this.running = false;
+        this.movementChangedQueued = true;
+      }
+      if (this.movementKeys.delete(e.code)) this.movementChangedQueued = true;
+    });
+    window.addEventListener('blur', () => {
+      const hadMovement = this.movementKeys.size > 0 || this.running || this.rotateDir !== 0;
+      this.movementKeys.clear();
+      this.running = false;
+      this.rotateDir = 0;
+      if (hadMovement) this.movementChangedQueued = true;
     });
   }
 
@@ -137,6 +155,13 @@ export class Input {
   takeQualityToggle(): boolean {
     const queued = this.qualityToggleQueued;
     this.qualityToggleQueued = false;
+    return queued;
+  }
+
+  /** True uma vez quando WASD/Shift mudou desde o ultimo frame. */
+  takeMovementChanged(): boolean {
+    const queued = this.movementChangedQueued;
+    this.movementChangedQueued = false;
     return queued;
   }
 

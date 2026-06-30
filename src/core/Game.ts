@@ -22,6 +22,8 @@ import { WeaponGlowEffect } from '../world/WeaponGlow';
 import { ZombieInstance, ZombieLibrary } from '../world/ZombieModel';
 import { preloadBladeFireTexture } from '../world/BladeFireParticles';
 import { Input } from './Input';
+import { KeyboardMoveController } from './KeyboardMoveController';
+import { ClientMovementPredictor } from './ClientMovementPredictor';
 import { PerfOverlay } from '../ui/PerfOverlay';
 
 interface View {
@@ -114,6 +116,10 @@ const FRAME_STALL_WARN_MS = 120;
 const FRAME_STALL_LOG_COOLDOWN_MS = 1500;
 const FRAME_STALL_SEVERE_MS = 500;
 // Fase 3 — culling de inimigos fora de tela + LOD de animação dos zumbis.
+const LOCAL_PLAYER_CORRECTION_RATE = 4;
+const REMOTE_RECONCILE_RATE = 28;
+const LOCAL_PLAYER_IGNORE_CORRECTION_DISTANCE = 0.85;
+const LOCAL_PLAYER_SNAP_CORRECTION_DISTANCE = 3;
 const ENEMY_CULL_RADIUS = 2.6;        // raio (un. de mundo) da esfera testada no frustum
 const ENEMY_CULL_CENTER_Y = 1.2;      // sobe o centro da esfera p/ a altura do corpo
 const ENEMY_CULL_MAX_DISTANCE = 95;   // além disso o inimigo nunca é desenhado
@@ -176,6 +182,7 @@ export class Game {
   private readonly cullFrustum = new THREE.Frustum();
   private readonly cullViewProjection = new THREE.Matrix4();
   private readonly cullSphere = new THREE.Sphere();
+  private readonly reconcileTarget = new THREE.Vector3();
   private readonly perf = new PerfOverlay();
   private readonly targetMarker: THREE.Mesh;
   private markerTimer = 0;
@@ -189,12 +196,17 @@ export class Game {
   private wasJumping = false;
   private elapsed = 0;
   private zone: WorldZone = 'overworld';
-  private keyboardMoveCooldown = 0;
+  private readonly keyboardMove = new KeyboardMoveController();
+  private readonly clientMovement = new ClientMovementPredictor();
   private equippedWeaponKey: string | null = null;
   private readonly forceWeaponGlowPreview = shouldForceWeaponGlowPreview();
   private useLightAssets = false;
   private damageTextSerial = 0;
   private selectedEnemyId: string | null = null;
+  private hudDirty = true;
+  private lastSnapshotTick = -1;
+  private localPlayerMoving = false;
+  private localPlayerRunning = false;
   private renderQualityMode: RenderQualityMode = this.readRenderQualityMode();
   private autoQualityLevel: RenderQualityLevel = this.initialAutoQualityLevel();
   private qualitySampleSeconds = 0;
@@ -491,12 +503,14 @@ export class Game {
     this.net.update(0);
     const snapshot = this.net.getSnapshot();
     const playerState = snapshot.entities.find((e) => e.id === this.net.playerId);
+    this.lastSnapshotTick = snapshot.tick;
     this.syncZone(snapshot.zone);
-    this.reconcile(snapshot.entities, 0);
+    this.reconcile(snapshot.entities, 0, true);
     this.syncCombatEvents(snapshot.combatEvents);
     this.reconcileLoot(snapshot.loot);
     this.reconcileChests(snapshot.chests);
     this.syncEquipment(snapshot.equippedWeapon);
+    this.updateLootViews();
     this.updateZombieAnimations(0);
     this.updateCameraAndMarker(0);
     this.updatePlayerModel(playerState, 0);
@@ -505,6 +519,7 @@ export class Game {
     this.updateBossSlamEffects(0);
     this.updateSkillEffects(0);
     this.hud.update(snapshot, playerState, this.selectedEnemy(snapshot.entities));
+    this.hudDirty = false;
     this.world.render(this.rig.camera);
   }
 
@@ -520,13 +535,19 @@ export class Game {
     this.net.update(dt);
     const snapshot = this.net.getSnapshot();
     const playerState = snapshot.entities.find((e) => e.id === this.net.playerId);
+    const snapshotChanged = snapshot.tick !== this.lastSnapshotTick;
 
-    this.syncZone(snapshot.zone);
-    this.reconcile(snapshot.entities, dt);
-    this.syncCombatEvents(snapshot.combatEvents);
-    this.reconcileLoot(snapshot.loot);
-    this.reconcileChests(snapshot.chests);
-    this.syncEquipment(snapshot.equippedWeapon);
+    if (snapshotChanged) {
+      this.lastSnapshotTick = snapshot.tick;
+      this.syncZone(snapshot.zone);
+      this.syncCombatEvents(snapshot.combatEvents);
+      this.reconcileLoot(snapshot.loot);
+      this.reconcileChests(snapshot.chests);
+      this.syncEquipment(snapshot.equippedWeapon);
+    }
+    this.reconcile(snapshot.entities, dt, snapshotChanged);
+    this.applyLocalPlayerMovement(dt);
+    this.updateLootViews();
     this.updateCameraAndMarker(dt);
     this.updatePlayerModel(playerState, dt);
     this.updateZombieAnimations(dt);
@@ -534,7 +555,10 @@ export class Game {
     this.updateHitEffects(dt);
     this.updateBossSlamEffects(dt);
     this.updateSkillEffects(dt);
-    this.hud.update(snapshot, playerState, this.selectedEnemy(snapshot.entities));
+    if (snapshotChanged || this.hudDirty) {
+      this.hud.update(snapshot, playerState, this.selectedEnemy(snapshot.entities));
+      this.hudDirty = false;
+    }
     this.world.render(this.rig.camera);
     this.handleFrameStallQuality(frameMs);
     this.logFrameStall(frameMs, snapshot);
@@ -559,8 +583,14 @@ export class Game {
   private selectedEnemy(entities: readonly EntityState[]): EntityState | undefined {
     if (!this.selectedEnemyId) return undefined;
     const enemy = entities.find((entity) => entity.id === this.selectedEnemyId && entity.kind === 'enemy' && entity.alive);
-    if (!enemy) this.selectedEnemyId = null;
+    if (!enemy) this.setSelectedEnemy(null);
     return enemy;
+  }
+
+  private setSelectedEnemy(id: string | null): void {
+    if (id === this.selectedEnemyId) return;
+    this.selectedEnemyId = id;
+    this.hudDirty = true;
   }
 
   private readRenderQualityMode(): RenderQualityMode {
@@ -700,27 +730,58 @@ export class Game {
       this.net.send({ type: 'cast-skill', entityId: this.net.playerId, skill: 'arcane-nova' });
     }
 
-    const axes = this.input.getMoveAxes();
-    if (axes.strafe !== 0 || axes.forward !== 0) {
-      this.keyboardMoveCooldown -= dt;
-      if (this.keyboardMoveCooldown <= 0) {
-        const player = this.latestEntities.get(this.net.playerId)?.position ?? this.views.get(this.net.playerId)?.group.position;
-        const direction = this.rig.getMoveDirection(axes.strafe, axes.forward);
-        if (player && (direction.x !== 0 || direction.z !== 0)) {
-          this.net.send({
-            type: 'move',
-            entityId: this.net.playerId,
-            target: { x: player.x + direction.x * 6, y: 0, z: player.z + direction.z * 6 },
-            run: this.input.running,
-          });
-          this.keyboardMoveCooldown = 0.1;
-        }
-      }
-    } else {
-      this.keyboardMoveCooldown = 0;
-    }
+    this.processKeyboardMove(dt);
 
     for (const ndc of this.input.takeClicks()) this.handleClick(ndc);
+  }
+
+  private processKeyboardMove(dt: number): void {
+    const movementChanged = this.input.takeMovementChanged();
+    const axes = this.input.getMoveAxes();
+    const player = this.views.get(this.net.playerId)?.group.position ?? this.latestEntities.get(this.net.playerId)?.position;
+    const direction = this.rig.getMoveDirection(axes.strafe, axes.forward);
+    const decision = this.keyboardMove.update({
+      dt,
+      movementChanged,
+      axes,
+      running: this.input.running,
+      player,
+      direction,
+    });
+    if (decision.type === 'none') return;
+    this.net.send({
+      type: 'move',
+      entityId: this.net.playerId,
+      target: decision.target,
+      run: decision.run,
+    });
+  }
+
+  private applyLocalPlayerMovement(dt: number): void {
+    this.localPlayerMoving = false;
+    this.localPlayerRunning = false;
+
+    const view = this.views.get(this.net.playerId);
+    const state = this.latestEntities.get(this.net.playerId);
+    if (!view || (state && !state.alive)) return;
+
+    const axes = this.input.getMoveAxes();
+    const direction = this.rig.getMoveDirection(axes.strafe, axes.forward);
+    const prediction = this.clientMovement.predict({
+      dt,
+      axes,
+      running: this.input.running,
+      direction,
+      current: view.group.position,
+      terrain: this.terrain,
+      zone: this.zone,
+    });
+    if (!prediction) return;
+
+    view.group.position.set(prediction.position.x, prediction.position.y, prediction.position.z);
+    view.group.rotation.y = prediction.rotationY;
+    this.localPlayerMoving = true;
+    this.localPlayerRunning = prediction.running;
   }
 
   private handleClick(ndc: THREE.Vector2): void {
@@ -729,7 +790,7 @@ export class Game {
 
     const portal = this.zone === 'overworld' ? this.world.getDungeonPortal() : this.world.getDungeonExit();
     if (portal && this.raycaster.intersectObject(portal, true).length > 0) {
-      this.selectedEnemyId = null;
+      this.setSelectedEnemy(null);
       this.sfx.play('arcane-nova');
       this.net.send({
         type: this.zone === 'overworld' ? 'enter-dungeon' : 'leave-dungeon',
@@ -743,7 +804,7 @@ export class Game {
       const id = this.findUserDataId(chestHits[0].object, 'chestId');
       const chest = id ? this.chestViews.get(id) : undefined;
       if (id && chest && !chest.opened) {
-        this.selectedEnemyId = null;
+        this.setSelectedEnemy(null);
         this.sfx.play('chest');
         this.net.send({ type: 'open-chest', entityId: this.net.playerId, chestId: id });
         return;
@@ -754,7 +815,7 @@ export class Game {
     if (lootHits.length > 0) {
       const id = this.findUserDataId(lootHits[0].object, 'lootId');
       if (id) {
-        this.selectedEnemyId = null;
+        this.setSelectedEnemy(null);
         this.sfx.play('pickup');
         this.net.send({ type: 'collect', entityId: this.net.playerId, lootId: id });
         return;
@@ -765,7 +826,7 @@ export class Game {
     if (enemyHits.length > 0) {
       const id = this.findUserDataId(enemyHits[0].object, 'entityId');
       if (id) {
-        this.selectedEnemyId = id;
+        this.setSelectedEnemy(id);
         this.net.send({ type: 'attack', entityId: this.net.playerId, targetId: id });
         return;
       }
@@ -776,7 +837,7 @@ export class Game {
       const p = groundHits[0].point;
       const closeLoot = this.findLootNear(p);
       if (closeLoot) {
-        this.selectedEnemyId = null;
+        this.setSelectedEnemy(null);
         this.sfx.play('pickup');
         this.net.send({ type: 'collect', entityId: this.net.playerId, lootId: closeLoot });
         return;
@@ -786,11 +847,11 @@ export class Game {
       const closeTarget = this.findCloseEnemy();
       const player = this.views.get(this.net.playerId)?.group.position;
       if (closeTarget && player && Math.hypot(p.x - player.x, p.z - player.z) <= CLOSE_CLICK_RADIUS) {
-        this.selectedEnemyId = closeTarget;
+        this.setSelectedEnemy(closeTarget);
         this.net.send({ type: 'attack', entityId: this.net.playerId, targetId: closeTarget });
         return;
       }
-      this.selectedEnemyId = null;
+      this.setSelectedEnemy(null);
       this.net.send({
         type: 'move',
         entityId: this.net.playerId,
@@ -811,7 +872,7 @@ export class Game {
     return null;
   }
 
-  private reconcile(entities: EntityState[], dt: number): void {
+  private reconcile(entities: EntityState[], dt: number, snapshotChanged = true): void {
     const seen = new Set<string>();
     this.latestEntities.clear();
 
@@ -829,20 +890,37 @@ export class Game {
       view.group.visible = e.kind === 'player'
         ? e.alive && (e.id !== this.net.playerId || !this.playerModel)
         : e.alive || e.action === 'dead';
+      const isLocalPlayer = e.id === this.net.playerId;
       if (!view.initialized || dt === 0) {
         view.group.position.set(e.position.x, e.position.y, e.position.z);
         view.group.rotation.y = e.rotationY;
         view.initialized = true;
+      } else if (isLocalPlayer && !snapshotChanged) {
+        // A pose local prevista no frame anterior continua valendo ate chegar um snapshot novo.
       } else {
         // A simulação envia poses a 30 Hz. Interpolar no render elimina a
         // sensação de "motion blur"/saltos sem alterar a lógica autoritativa.
-        const alpha = 1 - Math.exp(-28 * dt);
-        view.group.position.lerp(new THREE.Vector3(e.position.x, e.position.y, e.position.z), alpha);
-        const delta = Math.atan2(
-          Math.sin(e.rotationY - view.group.rotation.y),
-          Math.cos(e.rotationY - view.group.rotation.y),
-        );
-        view.group.rotation.y += delta * alpha;
+        this.reconcileTarget.set(e.position.x, e.position.y, e.position.z);
+        const correctionDistance = view.group.position.distanceTo(this.reconcileTarget);
+        const localKeyboardActive = isLocalPlayer && this.isKeyboardMovementActive();
+        const rate = localKeyboardActive
+          ? LOCAL_PLAYER_CORRECTION_RATE
+          : REMOTE_RECONCILE_RATE;
+        const alpha = 1 - Math.exp(-rate * dt);
+        if (isLocalPlayer && correctionDistance > LOCAL_PLAYER_SNAP_CORRECTION_DISTANCE) {
+          view.group.position.copy(this.reconcileTarget);
+        } else if (localKeyboardActive && correctionDistance <= LOCAL_PLAYER_IGNORE_CORRECTION_DISTANCE) {
+          // A predicao local ja esta perto da simulacao; corrigir aqui causa tremidinha visual.
+        } else {
+          view.group.position.lerp(this.reconcileTarget, alpha);
+        }
+        if (!localKeyboardActive) {
+          const delta = Math.atan2(
+            Math.sin(e.rotationY - view.group.rotation.y),
+            Math.cos(e.rotationY - view.group.rotation.y),
+          );
+          view.group.rotation.y += delta * alpha;
+        }
       }
       view.zombie?.setState(e.action);
 
@@ -872,6 +950,11 @@ export class Game {
       const idx = this.enemyMeshes.indexOf(view.group);
       if (idx >= 0) this.enemyMeshes.splice(idx, 1);
     }
+  }
+
+  private isKeyboardMovementActive(): boolean {
+    const axes = this.input.getMoveAxes();
+    return axes.strafe !== 0 || axes.forward !== 0;
   }
 
   private syncCombatEvents(events: readonly CombatEvent[]): void {
@@ -1330,12 +1413,8 @@ export class Game {
         void this.lootModels.replacePlaceholder(group, item);
       }
       view.baseY = item.position.y;
-      view.group.position.set(item.position.x, item.position.y + 0.16 + Math.sin(this.elapsed * 3 + view.phase) * 0.1, item.position.z);
-      view.group.rotation.y = this.elapsed * 1.7 + view.phase;
-      if (view.label) {
-        view.label.setWorldPosition(view.group.position.x, view.group.position.y + 0.98, view.group.position.z);
-        view.label.faceCamera(this.rig.camera);
-      }
+      view.group.position.x = item.position.x;
+      view.group.position.z = item.position.z;
     }
 
     for (const [id, view] of this.lootViews) {
@@ -1345,6 +1424,17 @@ export class Game {
       this.lootViews.delete(id);
       const index = this.lootMeshes.indexOf(view.group);
       if (index >= 0) this.lootMeshes.splice(index, 1);
+    }
+  }
+
+  private updateLootViews(): void {
+    for (const view of this.lootViews.values()) {
+      view.group.position.y = view.baseY + 0.16 + Math.sin(this.elapsed * 3 + view.phase) * 0.1;
+      view.group.rotation.y = this.elapsed * 1.7 + view.phase;
+      if (view.label) {
+        view.label.setWorldPosition(view.group.position.x, view.group.position.y + 0.98, view.group.position.z);
+        view.label.faceCamera(this.rig.camera);
+      }
     }
   }
 
@@ -1423,7 +1513,10 @@ export class Game {
     model.root.visible = true;
     model.setAttackSpeed(player.attackSpeed ?? 1);
 
-    model.setState(this.heroStateFor(player, jumping));
+    const state = this.localPlayerMoving && !jumping && player.alive && player.action !== 'attack'
+      ? this.localPlayerRunning ? 'run' : 'move'
+      : this.heroStateFor(player, jumping);
+    model.setState(state);
     model.update(dt);
   }
 
